@@ -9,7 +9,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include <string.h>
-#include <cstring> // Adicionado para corrigir o erro do strcpy
+#include <cstring>
 
 static const char *TAG = "SSH_Client";
 #define BOOT_BTN_PIN GPIO_NUM_0
@@ -25,30 +25,57 @@ static lv_obj_t * scr_password = NULL;
 static lv_obj_t * scr_ssh_config = NULL;
 static lv_obj_t * scr_terminal = NULL;
 
-// Componentes Wi-Fi
+static lv_obj_t * tv_ssh = NULL; // TabView global para redimensionamento
 static lv_obj_t * list_wifi = NULL;
 static lv_obj_t * ta_wifi_pass = NULL;
 static lv_obj_t * label_wifi_title = NULL;
 static char current_ssid[33] = {0};
 
-// Componentes SSH Config
 static lv_obj_t * lbl_local_ip = NULL;
 static lv_obj_t * ta_host = NULL;
 static lv_obj_t * ta_user = NULL;
 static lv_obj_t * ta_pass = NULL;
 static lv_obj_t * switch_auth = NULL;
+static lv_obj_t * ta_port = NULL;
 
-// Componentes Terminal
 static lv_obj_t * ta_log = NULL;
 static lv_obj_t * ta_input = NULL;
 static lv_obj_t * kb_terminal = NULL;
+
+// ==========================================
+// ESTILOS GLOBAIS (TEMA ESCURO)
+// ==========================================
+static void style_dark_ta(lv_obj_t * ta) {
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_text_color(ta, lv_color_white(), 0);
+    lv_obj_set_style_border_width(ta, 0, 0);
+    // Cursor luminoso idêntico ao app_notes
+    lv_obj_set_style_border_width(ta, 2, (lv_style_selector_t)LV_PART_CURSOR | (lv_style_selector_t)LV_STATE_FOCUSED);
+    lv_obj_set_style_border_side(ta, LV_BORDER_SIDE_LEFT, (lv_style_selector_t)LV_PART_CURSOR | (lv_style_selector_t)LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(ta, lv_color_white(), (lv_style_selector_t)LV_PART_CURSOR | (lv_style_selector_t)LV_STATE_FOCUSED);
+}
+
+static void style_dark_kb(lv_obj_t * kb) {
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x111111), LV_PART_MAIN); 
+    lv_obj_set_style_border_width(kb, 0, LV_PART_MAIN); 
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x333333), LV_PART_ITEMS); 
+    lv_obj_set_style_text_color(kb, lv_color_white(), LV_PART_ITEMS); 
+    lv_obj_set_style_border_width(kb, 0, LV_PART_ITEMS); 
+    // Teclas de controle escuras (Enter, Shift, Backspace)
+    lv_obj_set_style_bg_color(kb, lv_color_hex(0x444444), (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED); 
+    lv_obj_set_style_text_color(kb, lv_color_white(), (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED); 
+    // Margens anti-corte do visor circular
+    lv_obj_set_style_pad_left(kb, 15, 0);
+    lv_obj_set_style_pad_right(kb, 15, 0);
+    lv_obj_set_style_pad_bottom(kb, 15, 0);
+}
 
 // ==========================================
 // FUNÇÕES DE HARDWARE E SISTEMA
 // ==========================================
 static void return_to_factory() {
     ESP_LOGI(TAG, "Retornando ao Factory Firmware...");
-    if (lvgl_port_lock(0)) {
+    if (lvgl_port_lock(portMAX_DELAY)) {
         bsp_display_brightness_set(0); 
         lvgl_port_unlock();
     }
@@ -89,7 +116,7 @@ static void clear_i2c_bus(void) {
 static void show_splash_screen(const char* version) {
     scr_splash = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_splash, lv_color_black(), 0);
-    lv_obj_set_scrollbar_mode(scr_splash, LV_SCROLLBAR_MODE_OFF); 
+    lv_obj_set_scrollbar_mode(scr_splash, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_t * logo = lv_image_create(scr_splash);
     lv_image_set_src(logo, &icon_ssh);
@@ -110,6 +137,10 @@ static void show_splash_screen(const char* version) {
 // INTERFACE: WI-FI LISTA & SENHA
 // ==========================================
 static void start_wifi_scan(void) {
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+        esp_wifi_disconnect(); 
+    }
     wifi_scan_config_t scan_config = {};
     scan_config.show_hidden = false;
     scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
@@ -145,7 +176,6 @@ static void build_wifi_ui() {
     lv_obj_set_style_text_font(header, &lv_font_montserrat_20, 0);
     lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 30); 
 
-    // LISTA RECRIADA COM FLEXBOX (LVGL 9)
     list_wifi = lv_obj_create(scr_wifi_list);
     lv_obj_set_size(list_wifi, 310, 380); 
     lv_obj_align(list_wifi, LV_ALIGN_TOP_MID, 0, 70); 
@@ -171,12 +201,11 @@ static void build_wifi_ui() {
     lv_textarea_set_one_line(ta_wifi_pass, true);
     lv_obj_set_width(ta_wifi_pass, 310);
     lv_obj_align(ta_wifi_pass, LV_ALIGN_TOP_MID, 0, 70); 
+    style_dark_ta(ta_wifi_pass);
 
     lv_obj_t * kb = lv_keyboard_create(scr_password);
     lv_keyboard_set_textarea(kb, ta_wifi_pass);
-    lv_obj_set_style_bg_color(kb, lv_color_hex(0x111111), LV_PART_MAIN); 
-    lv_obj_set_style_bg_color(kb, lv_color_hex(0x333333), LV_PART_ITEMS); 
-    lv_obj_set_style_text_color(kb, lv_color_white(), LV_PART_ITEMS); 
+    style_dark_kb(kb);
     
     lv_obj_add_event_cb(kb, [](lv_event_t * e) {
         lv_label_set_text(label_wifi_title, "Conectando...");
@@ -203,6 +232,7 @@ static void terminal_kb_event_cb(lv_event_t * e) {
         lv_textarea_add_text(ta_log, "\nroot@server:~# ");
         lv_textarea_add_text(ta_log, cmd);
         lv_textarea_set_text(ta_input, ""); 
+        // O teclado continua aberto para próximos comandos
     }
 }
 
@@ -223,54 +253,77 @@ static void build_terminal_ui() {
     ta_input = lv_textarea_create(scr_terminal);
     lv_obj_set_size(ta_input, 390, 45);
     lv_obj_align(ta_input, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_set_style_bg_color(ta_input, lv_color_hex(0x111111), 0);
-    lv_obj_set_style_text_color(ta_input, lv_color_white(), 0);
-    lv_obj_set_style_border_width(ta_input, 1, 0);
     lv_textarea_set_one_line(ta_input, true);
     lv_textarea_set_placeholder_text(ta_input, "> Digite um comando...");
+    style_dark_ta(ta_input);
 
     kb_terminal = lv_keyboard_create(scr_terminal);
     lv_keyboard_set_textarea(kb_terminal, ta_input);
-    lv_obj_set_hidden(kb_terminal, true); // NOVO METODO LVGL 9
-    lv_obj_set_style_bg_color(kb_terminal, lv_color_hex(0x222222), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(kb_terminal, lv_color_hex(0x444444), LV_PART_ITEMS); 
+    lv_obj_set_hidden(kb_terminal, true); 
+    style_dark_kb(kb_terminal);
     lv_obj_add_event_cb(kb_terminal, terminal_kb_event_cb, LV_EVENT_READY, NULL);
 
     lv_obj_add_event_cb(ta_input, [](lv_event_t * e) {
-        lv_obj_set_hidden(kb_terminal, false); // NOVO METODO LVGL 9
+        lv_obj_set_hidden(kb_terminal, false);
         lv_obj_set_height(ta_log, 160);  
         lv_obj_align(ta_input, LV_ALIGN_TOP_MID, 0, 180); 
     }, LV_EVENT_FOCUSED, NULL);
 
     lv_obj_add_event_cb(ta_log, [](lv_event_t * e) {
-        lv_obj_set_hidden(kb_terminal, true); // NOVO METODO LVGL 9
+        lv_obj_set_hidden(kb_terminal, true); 
         lv_obj_set_height(ta_log, 420); 
         lv_obj_align(ta_input, LV_ALIGN_BOTTOM_MID, 0, -10); 
         lv_obj_remove_state(ta_input, LV_STATE_FOCUSED); 
     }, LV_EVENT_CLICKED, NULL);
 
+    // Botão Sair Compacto (Transparente, apenas com o ícone flutuando)
     lv_obj_t * btn_exit = lv_button_create(scr_terminal);
-    lv_obj_set_size(btn_exit, 50, 50);
-    lv_obj_align(btn_exit, LV_ALIGN_TOP_RIGHT, -10, 10);
-    lv_obj_set_style_bg_color(btn_exit, lv_color_hex(0xAA0000), 0);
-    lv_obj_set_style_bg_opa(btn_exit, LV_OPA_50, 0); 
+    lv_obj_set_size(btn_exit, 45, 45);
+    lv_obj_align(btn_exit, LV_ALIGN_TOP_RIGHT, -25, 25);
+    
+    // Remove o fundo, a borda e a sombra (deixa invisível)
+    lv_obj_set_style_bg_opa(btn_exit, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_exit, 0, 0);
+    lv_obj_set_style_shadow_width(btn_exit, 0, 0);
+    
     lv_obj_t * lbl_exit = lv_label_create(btn_exit);
     lv_label_set_text(lbl_exit, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_font(lbl_exit, &lv_font_montserrat_20, 0);
+    
+    // Pinta EXCLUSIVAMENTE o símbolo com um vermelho bem vivo
+    lv_obj_set_style_text_color(lbl_exit, lv_color_hex(0xFF0000), 0);
     lv_obj_center(lbl_exit);
-    lv_obj_add_event_cb(btn_exit, [](lv_event_t *e){ return_to_factory(); }, LV_EVENT_CLICKED, NULL);
+    
+    // Ação: Retornar para a tela de configurações do SSH (scr_ssh_config)
+    lv_obj_add_event_cb(btn_exit, [](lv_event_t *e){ 
+        lv_obj_set_hidden(kb_terminal, true); // Garante que o teclado suma
+        lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+        // Futuramente, adicionaremos o comando de desconectar o socket SSH aqui!
+    }, LV_EVENT_CLICKED, NULL);
 }
 
 // ==========================================
 // INTERFACE: SSH CONFIG (TAB VIEW)
 // ==========================================
+static lv_obj_t * conn_spinner = NULL;
+
 static void btn_connect_event_cb(lv_event_t * e) {
-    lv_obj_t * spinner = lv_spinner_create(scr_ssh_config);
-    lv_obj_set_size(spinner, 100, 100);
-    lv_obj_center(spinner);
-    lv_spinner_set_anim_params(spinner, 1000, 60);
+    if (conn_spinner) lv_obj_delete(conn_spinner); // Segurança caso clique 2 vezes
+    
+    conn_spinner = lv_spinner_create(scr_ssh_config);
+    lv_obj_set_size(conn_spinner, 100, 100);
+    lv_obj_center(conn_spinner);
+    lv_spinner_set_anim_params(conn_spinner, 1000, 60);
 
     lv_timer_create([](lv_timer_t * t) {
         lv_scr_load_anim(scr_terminal, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
+        
+        // Deleta o spinner da memória assim que a tela do terminal subir
+        if (conn_spinner) {
+            lv_obj_delete(conn_spinner);
+            conn_spinner = NULL;
+        }
+        
         lv_timer_delete(t);
     }, 2000, NULL);
 }
@@ -281,29 +334,26 @@ static void build_ssh_config_ui() {
 
     lbl_local_ip = lv_label_create(scr_ssh_config);
     lv_label_set_text(lbl_local_ip, "IP Local: Aguardando...");
-    lv_obj_set_style_text_color(lbl_local_ip, lv_color_hex(0x00FF00), 0); // Texto Inteiro Verde
+    lv_obj_set_style_text_color(lbl_local_ip, lv_color_hex(0x00FF00), 0); 
     lv_label_set_long_mode(lbl_local_ip, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_font(lbl_local_ip, &lv_font_montserrat_16, 0);
-    lv_obj_align(lbl_local_ip, LV_ALIGN_TOP_LEFT, 10, 10);
+    lv_obj_align(lbl_local_ip, LV_ALIGN_TOP_LEFT, 65, 10);
 
-    lv_obj_t * btn_exit = lv_button_create(scr_ssh_config);
-    lv_obj_set_size(btn_exit, 40, 40);
-    lv_obj_align(btn_exit, LV_ALIGN_TOP_RIGHT, -10, 5);
-    lv_obj_set_style_bg_color(btn_exit, lv_color_hex(0x880000), 0);
-    lv_obj_t * lbl_exit = lv_label_create(btn_exit);
-    lv_label_set_text(lbl_exit, LV_SYMBOL_POWER);
-    lv_obj_center(lbl_exit);
-    lv_obj_add_event_cb(btn_exit, [](lv_event_t *e){ return_to_factory(); }, LV_EVENT_CLICKED, NULL);
+    tv_ssh = lv_tabview_create(scr_ssh_config);
+    lv_tabview_set_tab_bar_position(tv_ssh, LV_DIR_TOP);
+    lv_tabview_set_tab_bar_size(tv_ssh, 50);
+    lv_obj_set_size(tv_ssh, 410, 440);
+    lv_obj_align(tv_ssh, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(tv_ssh, lv_color_black(), 0);
 
-    lv_obj_t * tv = lv_tabview_create(scr_ssh_config);
-    lv_tabview_set_tab_bar_position(tv, LV_DIR_TOP);
-    lv_tabview_set_tab_bar_size(tv, 50);
-    lv_obj_set_size(tv, 410, 440);
-    lv_obj_align(tv, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(tv, lv_color_black(), 0);
+    // Colorir Abas do TabView (Tema Escuro)
+    lv_obj_t * tab_bar = lv_tabview_get_tab_bar(tv_ssh);
+    lv_obj_set_style_bg_color(tab_bar, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_text_color(tab_bar, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(tab_bar, lv_color_white(), (lv_style_selector_t)LV_PART_ITEMS | (lv_style_selector_t)LV_STATE_CHECKED);
 
-    lv_obj_t * tab_new = lv_tabview_add_tab(tv, "Nova Conexão");
-    lv_obj_t * tab_saved = lv_tabview_add_tab(tv, "Salvos");
+    lv_obj_t * tab_new = lv_tabview_add_tab(tv_ssh, "Nova Conexao");
+    lv_obj_t * tab_saved = lv_tabview_add_tab(tv_ssh, "Salvos");
 
     lv_obj_set_flex_flow(tab_new, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tab_new, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -314,34 +364,54 @@ static void build_ssh_config_ui() {
     lv_textarea_set_one_line(ta_host, true);
     lv_textarea_set_placeholder_text(ta_host, "IP ou Hostname");
     lv_obj_set_width(ta_host, 340);
+    style_dark_ta(ta_host);
 
     ta_user = lv_textarea_create(tab_new);
     lv_textarea_set_one_line(ta_user, true);
     lv_textarea_set_placeholder_text(ta_user, "Usuario (ex: root)");
     lv_obj_set_width(ta_user, 340);
+    style_dark_ta(ta_user);
 
     ta_pass = lv_textarea_create(tab_new);
     lv_textarea_set_one_line(ta_pass, true);
     lv_textarea_set_password_mode(ta_pass, true);
     lv_textarea_set_placeholder_text(ta_pass, "Senha");
     lv_obj_set_width(ta_pass, 340);
+    style_dark_ta(ta_pass);
 
     lv_obj_t * row_opt = lv_obj_create(tab_new);
     lv_obj_set_size(row_opt, 340, 50);
     lv_obj_set_style_bg_opa(row_opt, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row_opt, 0, 0);
+    lv_obj_set_scrollbar_mode(row_opt, LV_SCROLLBAR_MODE_OFF); // <-- Corrige a barra de rolagem flutuando
     lv_obj_set_flex_flow(row_opt, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row_opt, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     switch_auth = lv_switch_create(row_opt);
+    
+    // Adiciona a lógica para desabilitar o campo de senha quando usar chave
+    lv_obj_add_event_cb(switch_auth, [](lv_event_t * e) {
+        lv_obj_t * sw = (lv_obj_t *)lv_event_get_target(e);
+        if (lv_obj_has_state(sw, LV_STATE_CHECKED)) {
+            // Usando Chave SD: Bloqueia e deixa o campo de senha "apagado"
+            lv_obj_add_state(ta_pass, LV_STATE_DISABLED);
+            lv_obj_set_style_opa(ta_pass, LV_OPA_30, 0); 
+            lv_textarea_set_text(ta_pass, ""); // Opcional: Limpa se tiver algo
+        } else {
+            // Usando Senha: Acende e destrava o campo
+            lv_obj_remove_state(ta_pass, LV_STATE_DISABLED);
+            lv_obj_set_style_opa(ta_pass, LV_OPA_COVER, 0);
+        }
+    }, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_t * lbl_sw = lv_label_create(row_opt);
     lv_label_set_text(lbl_sw, "Usar Chave SD");
     lv_obj_set_style_text_color(lbl_sw, lv_color_white(), 0);
 
-    lv_obj_t * ta_port = lv_textarea_create(row_opt);
+    ta_port = lv_textarea_create(row_opt);
     lv_textarea_set_one_line(ta_port, true);
     lv_textarea_set_text(ta_port, "22");
     lv_obj_set_width(ta_port, 80);
+    style_dark_ta(ta_port);
 
     lv_obj_t * btn_connect = lv_button_create(tab_new);
     lv_obj_set_size(btn_connect, 200, 60);
@@ -354,26 +424,47 @@ static void build_ssh_config_ui() {
     lv_obj_add_event_cb(btn_connect, btn_connect_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t * kb_config = lv_keyboard_create(scr_ssh_config);
-    lv_obj_set_hidden(kb_config, true); // NOVO METODO LVGL 9
+    lv_obj_set_hidden(kb_config, true); 
+    style_dark_kb(kb_config);
     
     auto kb_focus_cb = [](lv_event_t * e) {
         lv_obj_t * kb = (lv_obj_t *)lv_event_get_user_data(e);
         lv_obj_t * ta = (lv_obj_t *)lv_event_get_target(e);
         lv_keyboard_set_textarea(kb, ta);
         lv_obj_set_hidden(kb, false);
+        
+        if (tv_ssh) {
+            int y_offset = 0;
+            // Verifica quem chamou o evento e desliza a tela proporcionalmente
+            if (ta == ta_host) y_offset = -10;
+            else if (ta == ta_user) y_offset = -60;
+            else if (ta == ta_pass) y_offset = -110;
+            else if (ta == ta_port) y_offset = -150;
+            
+            lv_obj_set_style_translate_y(tv_ssh, y_offset, 0); 
+        }
     };
-    auto kb_defocus_cb = [](lv_event_t * e) {
+    
+    auto kb_hide_cb = [](lv_event_t * e) {
         lv_obj_t * kb = (lv_obj_t *)lv_event_get_user_data(e);
         lv_obj_set_hidden(kb, true);
+        
+        // Desliza a tela de volta para o lugar original quando o teclado fecha
+        if (tv_ssh) {
+            lv_obj_set_style_translate_y(tv_ssh, 0, 0); 
+        }
     };
 
     lv_obj_add_event_cb(ta_host, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
     lv_obj_add_event_cb(ta_user, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
     lv_obj_add_event_cb(ta_pass, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
     lv_obj_add_event_cb(ta_port, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
-    lv_obj_add_event_cb(tab_new, kb_defocus_cb, LV_EVENT_CLICKED, kb_config); 
+    
+    // Oculta ao tocar fora ou nos controles do teclado
+    lv_obj_add_event_cb(tab_new, kb_hide_cb, LV_EVENT_CLICKED, kb_config); 
+    lv_obj_add_event_cb(kb_config, kb_hide_cb, LV_EVENT_READY, kb_config);
+    lv_obj_add_event_cb(kb_config, kb_hide_cb, LV_EVENT_CANCEL, kb_config);
 
-    // ABA SALVOS RECRIADA COM FLEXBOX (LVGL 9)
     lv_obj_t * list_saved = lv_obj_create(tab_saved);
     lv_obj_set_size(list_saved, 360, 320);
     lv_obj_set_style_bg_color(list_saved, lv_color_black(), 0);
@@ -391,11 +482,8 @@ static void build_ssh_config_ui() {
         return btn;
     };
 
-    lv_obj_t * t1 = add_saved_btn(list_saved, "root @ 192.168.1.100 (Proxmox)");
-    lv_obj_t * t2 = add_saved_btn(list_saved, "ubuntu @ 10.0.0.50 (VPS)");
-
+    lv_obj_t * t1 = add_saved_btn(list_saved, "root @ 192.168.1.100");
     lv_obj_add_event_cb(t1, btn_connect_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(t2, btn_connect_event_cb, LV_EVENT_CLICKED, NULL);
 }
 
 // ==========================================
@@ -405,18 +493,15 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         wifi_config_t saved_config = {};
         esp_wifi_get_config(WIFI_IF_STA, &saved_config);
-        
         if (strlen((char*)saved_config.sta.ssid) > 0) {
-            ESP_LOGI(TAG, "Tentando auto-conectar a %s...", saved_config.sta.ssid);
+            ESP_LOGI(TAG, "Tentando auto-conectar...");
             esp_wifi_connect();
         } else {
-            ESP_LOGW(TAG, "Sem credenciais. Escaneando redes...");
             start_wifi_scan();
             lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
         }
     } 
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Falha de Conexão. Indo para Lista...");
         start_wifi_scan();
         lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
     } 
@@ -427,7 +512,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         
         wifi_ap_record_t *ap_info = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
         if (ap_info && esp_wifi_scan_get_ap_records(&ap_count, ap_info) == ESP_OK) {
-            if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+            if (bsp_display_lock(portMAX_DELAY)) {
                 lv_obj_clean(list_wifi); 
                 for (int i = 0; i < ap_count; i++) {
                     char ssid_str[33];
@@ -454,9 +539,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Conectado! IP Local: " IPSTR, IP2STR(&event->ip_info.ip));
-        
-        if (bsp_display_lock(pdMS_TO_TICKS(100))) {
+        if (bsp_display_lock(portMAX_DELAY)) {
             lv_label_set_text_fmt(lbl_local_ip, "IP Local: " IPSTR, IP2STR(&event->ip_info.ip));
             lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
             bsp_display_unlock();
@@ -480,12 +563,12 @@ static void wifi_init_client(void) {
 }
 
 // ==========================================
-// FUNÇÃO PRINCIPAL
+// FUNÇÃO PRINCIPAL (Sequência de Boot Segura)
 // ==========================================
 extern "C" void app_main(void) {
     clear_i2c_bus();
     
-    // 1. FORÇA OS RESISTORES DE PULL-UP INTERNOS (Corrige o aviso do I2C Master)
+    // Proteção de Hardware I2C (Evita colapso do AXP2101)
     gpio_set_pull_mode(GPIO_NUM_14, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(GPIO_NUM_15, GPIO_PULLUP_ONLY);
 
@@ -504,38 +587,28 @@ extern "C" void app_main(void) {
         nvs_flash_init();
     }
 
-    // 2. INICIA O DISPLAY E A SPLASH SCREEN
     bsp_display_start();
-    if (bsp_display_lock(pdMS_TO_TICKS(500))) {
+    if (bsp_display_lock(portMAX_DELAY)) {
         show_splash_screen("0.3-alpha");
         bsp_display_unlock();
     }
     
-    // DELAY CRUCIAL: Aguarda 200ms para a tela renderizar a imagem via DMA/SPI
     vTaskDelay(pdMS_TO_TICKS(200)); 
-    
-    // 3. LIGA O BRILHO (O barramento I2C agora está livre e com resistores ativos)
     bsp_display_brightness_set(80);
-    
-    // Aguarda o controlador de energia processar o PWM do brilho
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 4. MONTA A INTERFACE PESADA NA RAM
-    if (bsp_display_lock(pdMS_TO_TICKS(500))) {
+    if (bsp_display_lock(portMAX_DELAY)) {
         build_wifi_ui();
         build_ssh_config_ui();
         build_terminal_ui();
         bsp_display_unlock();
     }
 
-    // Respiro na CPU antes de montar partições físicas
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // 5. INICIA HARDWARE FÍSICO E CONEXÃO
     SdUsbManager::get_instance().init_local_storage();
     wifi_init_client(); 
 
-    // Loop vigiando o botão físico
     while(1) {
         if (gpio_get_level(BOOT_BTN_PIN) == 0) return_to_factory();
         vTaskDelay(pdMS_TO_TICKS(100));
