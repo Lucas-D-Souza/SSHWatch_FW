@@ -10,6 +10,19 @@
 #include "esp_partition.h"
 #include <string.h>
 #include <cstring>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include "libssh2.h"
+
+// ==========================================
+// VARIÁVEIS GLOBAIS DO SSH
+// ==========================================
+static int ssh_sock = -1;
+static LIBSSH2_SESSION *ssh_session = NULL;
+static LIBSSH2_CHANNEL *ssh_channel = NULL;
+static bool ssh_connected = false;
+static TaskHandle_t ssh_rx_task_handle = NULL;
 
 static const char *TAG = "SSH_Client";
 #define BOOT_BTN_PIN GPIO_NUM_0
@@ -223,16 +236,177 @@ static void build_wifi_ui() {
 }
 
 // ==========================================
+// MOTOR SSH (CORE 1 - FREE RTOS)
+// ==========================================
+static void ssh_disconnect() {
+    ssh_connected = false;
+    if (ssh_rx_task_handle) {
+        vTaskDelete(ssh_rx_task_handle);
+        ssh_rx_task_handle = NULL;
+    }
+    if (ssh_channel) {
+        libssh2_channel_send_eof(ssh_channel);
+        libssh2_channel_close(ssh_channel);
+        libssh2_channel_free(ssh_channel);
+        ssh_channel = NULL;
+    }
+    if (ssh_session) {
+        libssh2_session_disconnect(ssh_session, "Saindo do SSHWatch");
+        libssh2_session_free(ssh_session);
+        ssh_session = NULL;
+    }
+    if (ssh_sock != -1) {
+        close(ssh_sock);
+        ssh_sock = -1;
+    }
+}
+
+// Tarefa que fica vigiando se o Servidor mandou letras novas na tela
+static void ssh_rx_task(void *pvParameters) {
+    char buffer[256];
+    while (ssh_connected && ssh_channel) {
+        ssize_t rc = libssh2_channel_read(ssh_channel, buffer, sizeof(buffer) - 1);
+        if (rc > 0) {
+            buffer[rc] = '\0';
+            if (bsp_display_lock(portMAX_DELAY)) {
+                // Impede que o LVGL exploda a RAM limitando a 2000 letras na tela
+                if (strlen(lv_textarea_get_text(ta_log)) > 2000) {
+                    lv_textarea_set_text(ta_log, ""); 
+                }
+                lv_textarea_add_text(ta_log, buffer);
+                bsp_display_unlock();
+            }
+        } else if (rc == LIBSSH2_ERROR_EAGAIN) {
+            vTaskDelay(pdMS_TO_TICKS(50)); // Sem mensagens novas, espera um pouco
+        } else if (rc < 0) {
+            ESP_LOGE(TAG, "Erro de Leitura SSH: %d", (int)rc);
+            break;
+        } else if (libssh2_channel_eof(ssh_channel)) {
+            break; // Servidor encerrou a conexão
+        }
+    }
+    
+    ssh_disconnect();
+    if (bsp_display_lock(portMAX_DELAY)) {
+        lv_textarea_add_text(ta_log, "\n[Conexão Encerrada pelo Servidor]\n");
+        bsp_display_unlock();
+    }
+    ssh_rx_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Tarefa Pesada de Conexão
+static void ssh_connect_task(void *pvParameters) {
+    char host[64], user[64], pass[64], port_str[8];
+    bool use_key = false;
+
+    // 1. Copia os dados da interface com segurança
+    if (bsp_display_lock(portMAX_DELAY)) {
+        strncpy(host, lv_textarea_get_text(ta_host), 63);
+        strncpy(user, lv_textarea_get_text(ta_user), 63);
+        strncpy(pass, lv_textarea_get_text(ta_pass), 63);
+        strncpy(port_str, lv_textarea_get_text(ta_port), 7);
+        use_key = lv_obj_has_state(switch_auth, LV_STATE_CHECKED);
+        bsp_display_unlock();
+    }
+
+    ESP_LOGI(TAG, "Conectando via TCP a %s:%s...", host, port_str);
+    
+    struct sockaddr_in sin;
+    struct hostent *he = gethostbyname(host);
+    if (!he) goto connect_error;
+
+    ssh_sock = socket(AF_INET, SOCK_STREAM, 0);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(atoi(port_str));
+    sin.sin_addr = *(struct in_addr *)he->h_addr_list[0];
+
+    if (connect(ssh_sock, (struct sockaddr*)(&sin), sizeof(struct sockaddr_in)) != 0) {
+        ESP_LOGE(TAG, "Falha na conexão TCP.");
+        goto connect_error;
+    }
+
+    ESP_LOGI(TAG, "TCP OK! Iniciando Handshake SSH...");
+    ssh_session = libssh2_session_init();
+    libssh2_session_set_blocking(ssh_session, 1);
+    
+    if (libssh2_session_handshake(ssh_session, ssh_sock)) {
+        ESP_LOGE(TAG, "Falha no Handshake Criptográfico.");
+        goto connect_error;
+    }
+
+    ESP_LOGI(TAG, "Handshake OK! Autenticando...");
+    if (use_key) {
+        // Busca a chave na pasta que você pediu!
+        if (libssh2_userauth_publickey_fromfile(ssh_session, user, "/sdcard/SSH/id_rsa.pub", "/sdcard/SSH/id_rsa", pass)) {
+            ESP_LOGE(TAG, "Falha ao ler chave no SD ou Chave Recusada.");
+            goto connect_error;
+        }
+    } else {
+        if (libssh2_userauth_password(ssh_session, user, pass)) {
+            ESP_LOGE(TAG, "Senha Recusada pelo Servidor.");
+            goto connect_error;
+        }
+    }
+
+    ESP_LOGI(TAG, "Autenticado! Abrindo Terminal (PTY)...");
+    ssh_channel = libssh2_channel_open_session(ssh_session);
+    if (!ssh_channel) goto connect_error;
+
+    // Pede um emulador de terminal Linux padrão
+    if (libssh2_channel_request_pty(ssh_channel, "linux")) goto connect_error;
+    if (libssh2_channel_shell(ssh_channel)) goto connect_error;
+
+    // Configura para Modo Não-Bloqueante (Para podermos enviar e receber ao mesmo tempo)
+    libssh2_session_set_blocking(ssh_session, 0);
+    ssh_connected = true;
+
+    // SUCESSO! Muda a tela para o Terminal e apaga o Spinner
+    if (bsp_display_lock(portMAX_DELAY)) {
+        extern lv_obj_t * conn_spinner;
+        if (conn_spinner) { lv_obj_delete(conn_spinner); conn_spinner = NULL; }
+        
+        lv_textarea_set_text(ta_log, ""); // Limpa o texto padrão
+        lv_scr_load_anim(scr_terminal, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
+        bsp_display_unlock();
+    }
+
+    // Inicia o leitor de respostas do servidor
+    xTaskCreatePinnedToCore(ssh_rx_task, "ssh_rx", 8192, NULL, 5, &ssh_rx_task_handle, 1);
+    vTaskDelete(NULL);
+    return;
+
+connect_error:
+    ssh_disconnect();
+    if (bsp_display_lock(portMAX_DELAY)) {
+        extern lv_obj_t * conn_spinner;
+        if (conn_spinner) { lv_obj_delete(conn_spinner); conn_spinner = NULL; }
+        lv_label_set_text(lbl_local_ip, "#FF0000 Erro ao Conectar SSH!#");
+        bsp_display_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+// ==========================================
 // INTERFACE: TERMINAL DE COMANDO
 // ==========================================
 static void terminal_kb_event_cb(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     if(code == LV_EVENT_READY) {
         const char * cmd = lv_textarea_get_text(ta_input);
-        lv_textarea_add_text(ta_log, "\nroot@server:~# ");
-        lv_textarea_add_text(ta_log, cmd);
+        
+        // Se estiver conectado, envia o comando com o botão ENTER real!
+        if (ssh_connected && ssh_channel) {
+            char full_cmd[256];
+            snprintf(full_cmd, sizeof(full_cmd), "%s\n", cmd);
+            
+            // Pausa temporária no RX para escrever
+            libssh2_session_set_blocking(ssh_session, 1);
+            libssh2_channel_write(ssh_channel, full_cmd, strlen(full_cmd));
+            libssh2_session_set_blocking(ssh_session, 0);
+        }
+        
         lv_textarea_set_text(ta_input, ""); 
-        // O teclado continua aberto para próximos comandos
     }
 }
 
@@ -296,9 +470,9 @@ static void build_terminal_ui() {
     
     // Ação: Retornar para a tela de configurações do SSH (scr_ssh_config)
     lv_obj_add_event_cb(btn_exit, [](lv_event_t *e){ 
-        lv_obj_set_hidden(kb_terminal, true); // Garante que o teclado suma
+        lv_obj_set_hidden(kb_terminal, true); 
+        ssh_disconnect(); // CORTA A CONEXÃO DE VERDADE AQUI
         lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
-        // Futuramente, adicionaremos o comando de desconectar o socket SSH aqui!
     }, LV_EVENT_CLICKED, NULL);
 
     // =========================================
@@ -330,27 +504,18 @@ static void build_terminal_ui() {
 // ==========================================
 // INTERFACE: SSH CONFIG (TAB VIEW)
 // ==========================================
-static lv_obj_t * conn_spinner = NULL;
+lv_obj_t * conn_spinner = NULL;
 
 static void btn_connect_event_cb(lv_event_t * e) {
-    if (conn_spinner) lv_obj_delete(conn_spinner); // Segurança caso clique 2 vezes
+    if (conn_spinner) lv_obj_delete(conn_spinner); 
     
     conn_spinner = lv_spinner_create(scr_ssh_config);
     lv_obj_set_size(conn_spinner, 100, 100);
     lv_obj_center(conn_spinner);
     lv_spinner_set_anim_params(conn_spinner, 1000, 60);
 
-    lv_timer_create([](lv_timer_t * t) {
-        lv_scr_load_anim(scr_terminal, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
-        
-        // Deleta o spinner da memória assim que a tela do terminal subir
-        if (conn_spinner) {
-            lv_obj_delete(conn_spinner);
-            conn_spinner = NULL;
-        }
-        
-        lv_timer_delete(t);
-    }, 2000, NULL);
+    // Inicia o motor SSH em segundo plano com uma Pilha Gigante (Criptografia)
+    xTaskCreatePinnedToCore(ssh_connect_task, "ssh_conn", 24000, NULL, 5, NULL, 1);
 }
 
 static void build_ssh_config_ui() {
@@ -604,6 +769,7 @@ static void wifi_init_client(void) {
 // FUNÇÃO PRINCIPAL (Sequência de Boot Segura)
 // ==========================================
 extern "C" void app_main(void) {
+    libssh2_init(0);
     clear_i2c_bus();
     
     // Proteção de Hardware I2C (Evita colapso do AXP2101)
