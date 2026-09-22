@@ -300,6 +300,31 @@ static void build_terminal_ui() {
         lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
         // Futuramente, adicionaremos o comando de desconectar o socket SSH aqui!
     }, LV_EVENT_CLICKED, NULL);
+
+    // =========================================
+    // BOTÃO TROCAR WI-FI
+    // =========================================
+    lv_obj_t * btn_wifi = lv_button_create(scr_ssh_config);
+    lv_obj_set_size(btn_wifi, 40, 40);
+    lv_obj_align(btn_wifi, LV_ALIGN_TOP_RIGHT, -60, 5); // Posicionado ao lado do botão Sair
+    lv_obj_set_style_bg_color(btn_wifi, lv_color_hex(0x222222), 0); // Fundo escuro
+    lv_obj_set_style_radius(btn_wifi, LV_RADIUS_CIRCLE, 0); // Formato redondo
+    
+    lv_obj_t * lbl_wifi = lv_label_create(btn_wifi);
+    lv_label_set_text(lbl_wifi, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(lbl_wifi, lv_color_white(), 0); 
+    lv_obj_center(lbl_wifi);
+    
+    lv_obj_add_event_cb(btn_wifi, [](lv_event_t *e){ 
+        // 1. Limpa as credenciais atuais na memória para evitar auto-reconexão imediata
+        wifi_config_t empty_config = {};
+        esp_wifi_set_config(WIFI_IF_STA, &empty_config);
+        
+        // 2. Corta a conexão do rádio
+        // (A transição de tela e o novo escaneamento vão ser disparados 
+        // automaticamente pelo nosso wifi_event_handler!)
+        esp_wifi_disconnect(); 
+    }, LV_EVENT_CLICKED, NULL);
 }
 
 // ==========================================
@@ -493,17 +518,28 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         wifi_config_t saved_config = {};
         esp_wifi_get_config(WIFI_IF_STA, &saved_config);
+        
         if (strlen((char*)saved_config.sta.ssid) > 0) {
-            ESP_LOGI(TAG, "Tentando auto-conectar...");
             esp_wifi_connect();
         } else {
             start_wifi_scan();
-            lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+            // CADEADO DE SEGURANÇA ADICIONADO
+            if (bsp_display_lock(portMAX_DELAY)) {
+                lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+                bsp_display_unlock();
+            }
         }
     } 
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         start_wifi_scan();
-        lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+        // CADEADO DE SEGURANÇA ADICIONADO
+        if (bsp_display_lock(portMAX_DELAY)) {
+            // Só faz a animação se já não estivermos na lista (evita glitch visual)
+            if (lv_screen_active() != scr_wifi_list) {
+                lv_scr_load_anim(scr_wifi_list, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+            }
+            bsp_display_unlock();
+        }
     } 
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
         uint16_t ap_count = 0;
@@ -541,7 +577,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         if (bsp_display_lock(portMAX_DELAY)) {
             lv_label_set_text_fmt(lbl_local_ip, "IP Local: " IPSTR, IP2STR(&event->ip_info.ip));
-            lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
+            if (lv_screen_active() != scr_ssh_config) {
+                lv_scr_load_anim(scr_ssh_config, LV_SCR_LOAD_ANIM_FADE_ON, 400, 0, false);
+            }
             bsp_display_unlock();
         }
     }
