@@ -13,7 +13,11 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include "cJSON.h"
 #include "libssh2.h"
+
+LV_FONT_DECLARE(font_terminal_14);
 
 // ==========================================
 // VARIÁVEIS GLOBAIS DO SSH
@@ -26,12 +30,14 @@ static TaskHandle_t ssh_rx_task_handle = NULL;
 
 static const char *TAG = "SSH_Client";
 #define BOOT_BTN_PIN GPIO_NUM_0
+#define PROFILES_PATH "/sdcard/SSH/profiles.json"
 
 // ==========================================
 // VARIÁVEIS GLOBAIS E DE TELA
 // ==========================================
 LV_IMAGE_DECLARE(icon_ssh); 
 
+static lv_obj_t * list_saved = NULL;
 static lv_obj_t * scr_splash = NULL;
 static lv_obj_t * scr_wifi_list = NULL;
 static lv_obj_t * scr_password = NULL;
@@ -261,6 +267,36 @@ static void ssh_disconnect() {
     }
 }
 
+// Filtro ANSI/OSC para limpar o lixo do terminal
+static void filter_terminal_garbage(char *str) {
+    char *p = str;
+    char *out = str;
+    int state = 0; // 0:Texto, 1:ESC, 2:CSI ([), 3:OSC (])
+
+    while (*p) {
+        if (state == 0) {
+            if (*p == '\x1B') { // Encontrou caractere de Escape
+                state = 1;
+            } else if (*p != '\r') { // Ignora Carriage Return
+                *out++ = *p;
+            }
+        } else if (state == 1) {
+            if (*p == '[') state = 2;      // CSI (Cores)
+            else if (*p == ']') state = 3; // OSC (Integração Shell)
+            else state = 0; // Falha
+        } else if (state == 2) {
+            // Códigos de cor terminam em uma letra
+            if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z')) state = 0;
+        } else if (state == 3) {
+            // Códigos OSC terminam no caractere BEL (\a ou 0x07) ou em outro ESC
+            if (*p == '\x07' || *p == '\a') state = 0;
+            else if (*p == '\x1B') state = 1;
+        }
+        p++;
+    }
+    *out = '\0';
+}
+
 // Tarefa que fica vigiando se o Servidor mandou letras novas na tela
 static void ssh_rx_task(void *pvParameters) {
     char buffer[256];
@@ -268,6 +304,7 @@ static void ssh_rx_task(void *pvParameters) {
         ssize_t rc = libssh2_channel_read(ssh_channel, buffer, sizeof(buffer) - 1);
         if (rc > 0) {
             buffer[rc] = '\0';
+            filter_terminal_garbage(buffer);
             if (bsp_display_lock(portMAX_DELAY)) {
                 // Impede que o LVGL exploda a RAM limitando a 2000 letras na tela
                 if (strlen(lv_textarea_get_text(ta_log)) > 2000) {
@@ -354,7 +391,7 @@ static void ssh_connect_task(void *pvParameters) {
     if (!ssh_channel) goto connect_error;
 
     // Pede um emulador de terminal Linux padrão
-    if (libssh2_channel_request_pty(ssh_channel, "linux")) goto connect_error;
+    if (libssh2_channel_request_pty(ssh_channel, "dumb")) goto connect_error;
     if (libssh2_channel_shell(ssh_channel)) goto connect_error;
 
     // Configura para Modo Não-Bloqueante (Para podermos enviar e receber ao mesmo tempo)
@@ -422,9 +459,13 @@ static void build_terminal_ui() {
     lv_obj_set_style_text_color(ta_log, lv_color_hex(0x00FF00), 0); 
     lv_obj_set_style_border_width(ta_log, 0, 0);
     lv_textarea_set_cursor_click_pos(ta_log, false);
-    lv_textarea_set_text(ta_log, "Conectado com sucesso!\nSSHWatch OS v1.0\nType commands below.\n");
+    // 1. APLICA A FONTE NOVA NO LOG
+    lv_obj_set_style_text_font(ta_log, &font_terminal_14, 0); 
+    lv_textarea_set_text(ta_log, "Conectado com sucesso!\nSSHWatch OS v1.0\nTerminal Pronto.\n");
 
     ta_input = lv_textarea_create(scr_terminal);
+    // 2. APLICA A FONTE NOVA NO INPUT (Para alinhar o tamanho das letras quando digitar)
+    lv_obj_set_style_text_font(ta_input, &font_terminal_14, 0);
     lv_obj_set_size(ta_input, 390, 45);
     lv_obj_align(ta_input, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_textarea_set_one_line(ta_input, true);
@@ -518,6 +559,131 @@ static void btn_connect_event_cb(lv_event_t * e) {
     xTaskCreatePinnedToCore(ssh_connect_task, "ssh_conn", 24000, NULL, 5, NULL, 1);
 }
 
+// ==========================================
+// GERENCIADOR DE PERFIS (JSON no SD Card)
+// ==========================================
+static cJSON* load_profiles_json() {
+    FILE *f = fopen(PROFILES_PATH, "rb");
+    if (!f) return cJSON_CreateArray();
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    rewind(f);
+    if (len <= 0) { fclose(f); return cJSON_CreateArray(); }
+    
+    char *data = (char*)malloc(len + 1);
+    fread(data, 1, len, f);
+    data[len] = '\0';
+    fclose(f);
+    
+    cJSON *root = cJSON_Parse(data);
+    free(data);
+    return root ? root : cJSON_CreateArray();
+}
+
+static void reload_saved_profiles(); // Assinatura
+
+static void profile_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * btn = (lv_obj_t *)lv_event_get_target(e);
+    int index = lv_obj_get_index(btn); // O índice do botão bate com o índice do Array JSON!
+
+    cJSON *root = load_profiles_json();
+    cJSON *item = cJSON_GetArrayItem(root, index);
+    if (!item) { cJSON_Delete(root); return; }
+
+    if (code == LV_EVENT_SHORT_CLICKED) {
+        // Preenche o formulário
+        lv_textarea_set_text(ta_host, cJSON_GetObjectItem(item, "host")->valuestring);
+        lv_textarea_set_text(ta_user, cJSON_GetObjectItem(item, "user")->valuestring);
+        lv_textarea_set_text(ta_port, cJSON_GetObjectItem(item, "port")->valuestring);
+        
+        bool use_key = cJSON_GetObjectItem(item, "use_key")->valueint;
+        if (use_key) {
+            lv_obj_add_state(switch_auth, LV_STATE_CHECKED);
+            lv_obj_send_event(switch_auth, LV_EVENT_VALUE_CHANGED, NULL); // Força atualização visual
+            
+            // É via chave? Já temos tudo. Conecta imediatamente!
+            cJSON_Delete(root);
+            btn_connect_event_cb(NULL);
+            return;
+        } else {
+            lv_obj_remove_state(switch_auth, LV_STATE_CHECKED);
+            lv_obj_send_event(switch_auth, LV_EVENT_VALUE_CHANGED, NULL);
+            lv_textarea_set_text(ta_pass, ""); // Esvazia a senha velha
+            
+            // Pula pra aba do formulário e JOGA O FOCO na Senha para o teclado subir
+            lv_tabview_set_act(tv_ssh, 0, LV_ANIM_ON);
+            lv_obj_send_event(ta_pass, LV_EVENT_FOCUSED, NULL); 
+        }
+    } 
+    else if (code == LV_EVENT_LONG_PRESSED) {
+        // Apaga do JSON no clique longo
+        cJSON_DeleteItemFromArray(root, index);
+        char *json_str = cJSON_PrintUnformatted(root);
+        FILE *f = fopen(PROFILES_PATH, "wb");
+        if (f) {
+            fwrite(json_str, 1, strlen(json_str), f);
+            fclose(f);
+        }
+        free(json_str);
+        reload_saved_profiles();
+    }
+    cJSON_Delete(root);
+}
+
+static void reload_saved_profiles() {
+    lv_obj_clean(list_saved);
+    cJSON *root = load_profiles_json();
+    int count = cJSON_GetArraySize(root);
+    
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_GetArrayItem(root, i);
+        const char* host = cJSON_GetObjectItem(item, "host")->valuestring;
+        const char* user = cJSON_GetObjectItem(item, "user")->valuestring;
+        bool use_key = cJSON_GetObjectItem(item, "use_key")->valueint;
+        
+        lv_obj_t * btn = lv_button_create(list_saved);
+        lv_obj_set_width(btn, lv_pct(100));
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
+        
+        lv_obj_t * lbl = lv_label_create(btn);
+        // Coloca o ícone de chave se usar chave, ou diretório se for senha
+        const char* icon = use_key ? LV_SYMBOL_SETTINGS : LV_SYMBOL_DIRECTORY;
+        lv_label_set_text_fmt(lbl, "%s %s@%s", icon, user, host);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_center(lbl);
+        
+        lv_obj_add_event_cb(btn, profile_event_cb, LV_EVENT_ALL, NULL);
+    }
+    cJSON_Delete(root);
+}
+
+static void btn_save_event_cb(lv_event_t * e) {
+    const char* host = lv_textarea_get_text(ta_host);
+    const char* user = lv_textarea_get_text(ta_user);
+    if (strlen(host) == 0 || strlen(user) == 0) return;
+
+    cJSON *root = load_profiles_json();
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "host", host);
+    cJSON_AddStringToObject(item, "user", user);
+    cJSON_AddStringToObject(item, "port", lv_textarea_get_text(ta_port));
+    cJSON_AddBoolToObject(item, "use_key", lv_obj_has_state(switch_auth, LV_STATE_CHECKED));
+    cJSON_AddItemToArray(root, item);
+
+    char *json_str = cJSON_PrintUnformatted(root);
+    FILE *f = fopen(PROFILES_PATH, "wb");
+    if (f) {
+        fwrite(json_str, 1, strlen(json_str), f);
+        fclose(f);
+    }
+    free(json_str);
+    cJSON_Delete(root);
+
+    reload_saved_profiles();
+    lv_tabview_set_act(tv_ssh, 1, LV_ANIM_ON); // Pula direto pra aba de Salvos pra você ver!
+}
+
 static void build_ssh_config_ui() {
     scr_ssh_config = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_ssh_config, lv_color_black(), 0);
@@ -603,8 +769,22 @@ static void build_ssh_config_ui() {
     lv_obj_set_width(ta_port, 80);
     style_dark_ta(ta_port);
 
-    lv_obj_t * btn_connect = lv_button_create(tab_new);
-    lv_obj_set_size(btn_connect, 200, 60);
+    // Garante que a pasta existe no SD
+    struct stat st;
+    if (stat("/sdcard/SSH", &st) == -1) mkdir("/sdcard/SSH", 0700);
+
+    // Cria uma "Linha" para acomodar dois botões
+    lv_obj_t * row_btns = lv_obj_create(tab_new);
+    lv_obj_set_size(row_btns, 340, 60);
+    lv_obj_set_style_bg_opa(row_btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row_btns, 0, 0);
+    lv_obj_set_scrollbar_mode(row_btns, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_flex_flow(row_btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_btns, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // Botão Conectar (Menor)
+    lv_obj_t * btn_connect = lv_button_create(row_btns);
+    lv_obj_set_size(btn_connect, 160, 50);
     lv_obj_set_style_bg_color(btn_connect, lv_color_hex(0x007BFF), 0);
     lv_obj_set_style_radius(btn_connect, 30, 0);
     lv_obj_t * lbl_conn = lv_label_create(btn_connect);
@@ -612,6 +792,17 @@ static void build_ssh_config_ui() {
     lv_obj_set_style_text_font(lbl_conn, &lv_font_montserrat_20, 0);
     lv_obj_center(lbl_conn);
     lv_obj_add_event_cb(btn_connect, btn_connect_event_cb, LV_EVENT_CLICKED, NULL);
+
+    // Botão Salvar (Verde)
+    lv_obj_t * btn_save = lv_button_create(row_btns);
+    lv_obj_set_size(btn_save, 160, 50);
+    lv_obj_set_style_bg_color(btn_save, lv_color_hex(0x28A745), 0);
+    lv_obj_set_style_radius(btn_save, 30, 0);
+    lv_obj_t * lbl_save = lv_label_create(btn_save);
+    lv_label_set_text(lbl_save, LV_SYMBOL_SAVE " Salvar");
+    lv_obj_set_style_text_font(lbl_save, &lv_font_montserrat_20, 0);
+    lv_obj_center(lbl_save);
+    lv_obj_add_event_cb(btn_save, btn_save_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t * kb_config = lv_keyboard_create(scr_ssh_config);
     lv_obj_set_hidden(kb_config, true); 
@@ -625,7 +816,6 @@ static void build_ssh_config_ui() {
         
         if (tv_ssh) {
             int y_offset = 0;
-            // Verifica quem chamou o evento e desliza a tela proporcionalmente
             if (ta == ta_host) y_offset = -10;
             else if (ta == ta_user) y_offset = -60;
             else if (ta == ta_pass) y_offset = -110;
@@ -638,11 +828,7 @@ static void build_ssh_config_ui() {
     auto kb_hide_cb = [](lv_event_t * e) {
         lv_obj_t * kb = (lv_obj_t *)lv_event_get_user_data(e);
         lv_obj_set_hidden(kb, true);
-        
-        // Desliza a tela de volta para o lugar original quando o teclado fecha
-        if (tv_ssh) {
-            lv_obj_set_style_translate_y(tv_ssh, 0, 0); 
-        }
+        if (tv_ssh) lv_obj_set_style_translate_y(tv_ssh, 0, 0); 
     };
 
     lv_obj_add_event_cb(ta_host, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
@@ -650,30 +836,36 @@ static void build_ssh_config_ui() {
     lv_obj_add_event_cb(ta_pass, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
     lv_obj_add_event_cb(ta_port, kb_focus_cb, LV_EVENT_FOCUSED, kb_config);
     
-    // Oculta ao tocar fora ou nos controles do teclado
     lv_obj_add_event_cb(tab_new, kb_hide_cb, LV_EVENT_CLICKED, kb_config); 
     lv_obj_add_event_cb(kb_config, kb_hide_cb, LV_EVENT_READY, kb_config);
     lv_obj_add_event_cb(kb_config, kb_hide_cb, LV_EVENT_CANCEL, kb_config);
 
-    lv_obj_t * list_saved = lv_obj_create(tab_saved);
+    // Inicializa a lista e carrega do JSON automaticamente
+    list_saved = lv_obj_create(tab_saved);
     lv_obj_set_size(list_saved, 360, 320);
     lv_obj_set_style_bg_color(list_saved, lv_color_black(), 0);
     lv_obj_set_style_border_width(list_saved, 0, 0);
     lv_obj_set_flex_flow(list_saved, LV_FLEX_FLOW_COLUMN);
 
-    auto add_saved_btn = [](lv_obj_t * parent, const char * txt) {
-        lv_obj_t * btn = lv_button_create(parent);
-        lv_obj_set_width(btn, lv_pct(100));
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x222222), 0);
-        lv_obj_t * lbl = lv_label_create(btn);
-        lv_label_set_text_fmt(lbl, "%s %s", LV_SYMBOL_DIRECTORY, txt);
-        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-        lv_obj_center(lbl);
-        return btn;
-    };
-
-    lv_obj_t * t1 = add_saved_btn(list_saved, "root @ 192.168.1.100");
-    lv_obj_add_event_cb(t1, btn_connect_event_cb, LV_EVENT_CLICKED, NULL);
+    // =========================================
+    // BOTÃO TROCAR WI-FI
+    // =========================================
+    lv_obj_t * btn_wifi = lv_button_create(scr_ssh_config);
+    lv_obj_set_size(btn_wifi, 40, 40);
+    lv_obj_align(btn_wifi, LV_ALIGN_TOP_RIGHT, -60, 5); 
+    lv_obj_set_style_bg_color(btn_wifi, lv_color_hex(0x222222), 0); 
+    lv_obj_set_style_radius(btn_wifi, LV_RADIUS_CIRCLE, 0); 
+    
+    lv_obj_t * lbl_wifi = lv_label_create(btn_wifi);
+    lv_label_set_text(lbl_wifi, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_color(lbl_wifi, lv_color_white(), 0); 
+    lv_obj_center(lbl_wifi);
+    
+    lv_obj_add_event_cb(btn_wifi, [](lv_event_t *e){ 
+        wifi_config_t empty_config = {};
+        esp_wifi_set_config(WIFI_IF_STA, &empty_config);
+        esp_wifi_disconnect(); 
+    }, LV_EVENT_CLICKED, NULL);
 }
 
 // ==========================================
@@ -811,6 +1003,10 @@ extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
 
     SdUsbManager::get_instance().init_local_storage();
+    if (bsp_display_lock(portMAX_DELAY)) {
+        reload_saved_profiles();
+        bsp_display_unlock();
+    }
     wifi_init_client(); 
 
     while(1) {
